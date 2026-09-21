@@ -1,114 +1,296 @@
-// supabase/functions/noma-chat/index.ts
-//
-// Flujo (adaptado para el CrowPanel 1.46" -- sin altavoz):
-//   1. El reloj sube un audio (WAV, capturado del micrófono PDM) por POST junto a un device_id.
-//   2. Se transcribe con Whisper (OpenAI).
-//   3. Se manda la pregunta + historial a gpt-6-astra con la personalidad de Noma.
-//   4. Se devuelve la respuesta como JSON de texto, para mostrarla en la pantalla redonda.
-//
-// DESPLIEGUE:
-//   supabase functions deploy noma-chat
-//   supabase secrets set OPENAI_API_KEY=tu_clave
-//
-// TABLA NECESARIA (ejecutar una vez en el SQL editor de Supabase):
-//
-//   create table noma_historial (
-//     id bigint generated always as identity primary key,
-//     device_id text not null,
-//     role text not null,
-//     content text not null,
-//     created_at timestamp with time zone default now()
-//   );
 
 import { createClient } from "https://esm.sh/@supabase/supabase-js@2";
 
-const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY")!;
-const SUPABASE_URL = Deno.env.get("SUPABASE_URL")!;
-const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!;
+const OPENAI_API_KEY = Deno.env.get("OPENAI_API_KEY");
+const SUPABASE_URL = Deno.env.get("SUPABASE_URL");
+const SUPABASE_SERVICE_ROLE_KEY = Deno.env.get(
+  "SUPABASE_SERVICE_ROLE_KEY"
+);
 
-const supabase = createClient(SUPABASE_URL, SUPABASE_SERVICE_ROLE_KEY);
+if (
+  !OPENAI_API_KEY ||
+  !SUPABASE_URL ||
+  !SUPABASE_SERVICE_ROLE_KEY
+) {
+  throw new Error("Faltan secretos de configuración del servidor");
+}
 
-const SYSTEM_PROMPT = `Eres NOMA, una asistente de IA con espíritu investigador: curiosa,
-analítica y meticulosa antes de responder. Tu trato es amable, cercano y humilde -- nunca
-arrogante, y reconoces con naturalidad cuando algo no lo sabes con certeza. Tu punto fuerte
-es la toma de decisiones: cuando te preguntan qué hacer, sopesas las opciones con cuidado y
-das una recomendación clara y bien razonada, no una lista ambigua de posibilidades.
-Respondes siempre en español, de forma breve (2-3 frases cortas), porque tu respuesta se
-muestra como texto en una pantalla redonda pequeña de un reloj -- nada de listas, markdown
-ni párrafos largos.`;
+const supabase = createClient(
+  SUPABASE_URL,
+  SUPABASE_SERVICE_ROLE_KEY
+);
 
-const MAX_TURNOS_HISTORIAL = 10; // cuántos mensajes atrás recordar
+const OPENAI_URL = "https://api.openai.com/v1";
+const CHAT_MODEL = "gpt-5.6-luna";
+const MAX_TURNOS_HISTORIAL = 10;
+const MAX_AUDIO_BYTES = 10 * 1024 * 1024;
 
-Deno.serve(async (req) => {
+const SYSTEM_PROMPT = `
+Eres NOMA, una asistente de IA con espíritu investigador:
+curiosa, analítica y meticulosa antes de responder.
+
+Tu trato es amable, cercano y humilde.
+Reconoces con naturalidad cuando no sabes algo con certeza.
+
+Cuando el usuario pide ayuda para decidir, explica brevemente
+las opciones y sus consecuencias sin imponer una decisión.
+
+Respondes siempre en español.
+Tu respuesta debe ser breve, de 2 o 3 frases cortas,
+porque se mostrará en la pantalla pequeña de un reloj.
+
+No uses listas, Markdown ni párrafos largos.
+`;
+
+function jsonResponse(
+  body: Record<string, unknown>,
+  status = 200
+): Response {
+  return new Response(JSON.stringify(body), {
+    status,
+    headers: {
+      "Content-Type": "application/json; charset=utf-8",
+      "Access-Control-Allow-Origin": "*",
+      "Access-Control-Allow-Headers": "authorization, x-client-info, apikey, content-type",
+    },
+  });
+}
+
+function getOpenAIError(data: any): string {
+  return (
+    data?.error?.message ||
+    data?.message ||
+    "Error desconocido de OpenAI"
+  );
+}
+
+Deno.serve(async (req: Request): Promise<Response> => {
+  if (req.method === "OPTIONS") {
+    return new Response("ok", {
+      headers: {
+        "Access-Control-Allow-Origin": "*",
+        "Access-Control-Allow-Headers":
+          "authorization, x-client-info, apikey, content-type",
+      },
+    });
+  }
+
+  if (req.method !== "POST") {
+    return jsonResponse(
+      { error: "Método no permitido. Usa POST." },
+      405
+    );
+  }
+
   try {
     const formData = await req.formData();
-    const audioFile = formData.get("audio") as File;
-    const deviceId = (formData.get("device_id") as string) ?? "reloj-1";
 
-    if (!audioFile) {
-      return new Response(JSON.stringify({ error: "Falta el archivo de audio" }), { status: 400 });
+    const audioValue = formData.get("audio");
+    const deviceIdValue = formData.get("device_id");
+
+    if (!(audioValue instanceof File)) {
+      return jsonResponse(
+        { error: "Falta un archivo de audio válido." },
+        400
+      );
     }
 
-    // 1. Transcribir el audio con Whisper
+    if (audioValue.size === 0) {
+      return jsonResponse(
+        { error: "El archivo de audio está vacío." },
+        400
+      );
+    }
+
+    if (audioValue.size > MAX_AUDIO_BYTES) {
+      return jsonResponse(
+        { error: "El archivo de audio es demasiado grande." },
+        413
+      );
+    }
+
+    const deviceId =
+      typeof deviceIdValue === "string" &&
+      deviceIdValue.trim().length > 0
+        ? deviceIdValue.trim()
+        : "reloj-1";
+
+    if (deviceId.length > 100) {
+      return jsonResponse(
+        { error: "El device_id es demasiado largo." },
+        400
+      );
+    }
+
+    // 1. Transcribir el audio con OpenAI
     const whisperForm = new FormData();
-    whisperForm.append("file", audioFile, "audio.wav");
+
+    whisperForm.append(
+      "file",
+      audioValue,
+      audioValue.name || "audio.wav"
+    );
+
     whisperForm.append("model", "whisper-1");
     whisperForm.append("language", "es");
+    whisperForm.append("response_format", "json");
 
-    const whisperRes = await fetch("https://api.openai.com/v1/audio/transcriptions", {
-      method: "POST",
-      headers: { Authorization: `Bearer ${OPENAI_API_KEY}` },
-      body: whisperForm,
-    });
-    const whisperData = await whisperRes.json();
-    const pregunta: string = whisperData.text?.trim();
+    const whisperResponse = await fetch(
+      `${OPENAI_URL}/audio/transcriptions`,
+      {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+        },
+        body: whisperForm,
+      }
+    );
 
-    if (!pregunta) {
-      return new Response(JSON.stringify({ respuesta: "No te he entendido, prueba otra vez." }), { status: 200 });
+    const whisperData = await whisperResponse.json();
+
+    if (!whisperResponse.ok) {
+      console.error("Error de Whisper:", whisperData);
+
+      return jsonResponse(
+        {
+          error: "No se pudo transcribir el audio.",
+          details: getOpenAIError(whisperData),
+        },
+        502
+      );
     }
 
-    // 2. Recuperar historial reciente de este reloj
-    const { data: historialPrevio } = await supabase
+    const pregunta =
+      typeof whisperData?.text === "string"
+        ? whisperData.text.trim()
+        : "";
+
+    if (!pregunta) {
+      return jsonResponse({
+        respuesta: "No te he entendido. Prueba otra vez.",
+      });
+    }
+
+    // 2. Recuperar el historial del dispositivo
+    const {
+      data: historialPrevio,
+      error: historialError,
+    } = await supabase
       .from("noma_historial")
       .select("role, content")
       .eq("device_id", deviceId)
       .order("created_at", { ascending: false })
       .limit(MAX_TURNOS_HISTORIAL);
 
-    const historial = (historialPrevio ?? []).reverse();
+    if (historialError) {
+      console.error("Error al leer el historial:", historialError);
 
-    // 3. Preguntar a Noma (gpt-6-astra)
-    const chatRes = await fetch("https://api.openai.com/v1/chat/completions", {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        Authorization: `Bearer ${OPENAI_API_KEY}`,
-      },
-      body: JSON.stringify({
-        model: "gpt-6-astra",
-        max_tokens: 200,
-        messages: [
-          { role: "system", content: SYSTEM_PROMPT },
-          ...historial,
-          { role: "user", content: pregunta },
-        ],
-      }),
+      return jsonResponse(
+        { error: "No se pudo recuperar el historial." },
+        500
+      );
+    }
+
+    const historial = (historialPrevio ?? [])
+      .reverse()
+      .filter(
+        (item) =>
+          (item.role === "user" || item.role === "assistant") &&
+          typeof item.content === "string"
+      );
+
+    // 3. Enviar la pregunta al modelo
+    const chatResponse = await fetch(
+      `${OPENAI_URL}/chat/completions`,
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          Authorization: `Bearer ${OPENAI_API_KEY}`,
+        },
+        body: JSON.stringify({
+          model: CHAT_MODEL,
+          max_tokens: 200,
+          messages: [
+            {
+              role: "system",
+              content: SYSTEM_PROMPT,
+            },
+            ...historial,
+            {
+              role: "user",
+              content: pregunta,
+            },
+          ],
+        }),
+      }
+    );
+
+    const chatData = await chatResponse.json();
+
+    if (!chatResponse.ok) {
+      console.error("Error del modelo:", chatData);
+
+      return jsonResponse(
+        {
+          error: "No se pudo obtener una respuesta de NOMA.",
+          details: getOpenAIError(chatData),
+        },
+        502
+      );
+    }
+
+    const respuesta =
+      chatData?.choices?.[0]?.message?.content?.trim();
+
+    if (!respuesta) {
+      console.error("Respuesta inesperada del modelo:", chatData);
+
+      return jsonResponse(
+        { error: "El modelo devolvió una respuesta vacía." },
+        502
+      );
+    }
+
+    // 4. Guardar la conversación
+    const { error: insertError } = await supabase
+      .from("noma_historial")
+      .insert([
+        {
+          device_id: deviceId,
+          role: "user",
+          content: pregunta,
+        },
+        {
+          device_id: deviceId,
+          role: "assistant",
+          content: respuesta,
+        },
+      ]);
+
+    if (insertError) {
+      console.error("Error al guardar historial:", insertError);
+
+      // La respuesta se puede devolver aunque falle el historial.
+      return jsonResponse({
+        pregunta,
+        respuesta,
+        historial_guardado: false,
+      });
+    }
+
+    // 5. Devolver la respuesta al reloj
+    return jsonResponse({
+      pregunta,
+      respuesta,
+      historial_guardado: true,
     });
-    const chatData = await chatRes.json();
-    const respuesta: string = chatData.choices[0].message.content;
+  } catch (error) {
+    console.error("Error interno de NOMA:", error);
 
-    // 4. Guardar los dos turnos nuevos en el historial
-    await supabase.from("noma_historial").insert([
-      { device_id: deviceId, role: "user", content: pregunta },
-      { device_id: deviceId, role: "assistant", content: respuesta },
-    ]);
-
-    // 5. Devolver el texto para que el reloj lo muestre en pantalla
-    return new Response(JSON.stringify({ pregunta, respuesta }), {
-      status: 200,
-      headers: { "Content-Type": "application/json" },
-    });
-  } catch (err) {
-    return new Response(JSON.stringify({ error: String(err) }), { status: 500 });
+    return jsonResponse(
+      { error: "Error interno del servidor." },
+      500
+    );
   }
 });
